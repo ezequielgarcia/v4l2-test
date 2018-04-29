@@ -22,8 +22,11 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 
-#include <linux/videodev2.h>
+#include "videodev2.h"
+
+#define USE_FENCE 1
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
@@ -31,11 +34,14 @@ enum io_method {
 	IO_METHOD_READ,
 	IO_METHOD_MMAP,
 	IO_METHOD_USERPTR,
+	IO_METHOD_DMABUF,
 };
 
 struct buffer {
 	void   *start;
 	size_t  length;
+	int     fence_fd;
+	int     index;
 };
 
 static char            *dev_name;
@@ -45,7 +51,7 @@ struct buffer          *buffers;
 static unsigned int     n_buffers;
 static int              out_buf;
 static int              force_format;
-static int              frame_count = 70;
+static int              frame_count = -1;
 
 static void errno_exit(const char *s)
 {
@@ -108,6 +114,10 @@ static int read_frame(void)
 		if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf)) {
 			switch (errno) {
 			case EAGAIN:
+#ifdef USE_FENCE
+				fprintf(stderr, "not supposed to EAGAIN\n");
+				exit(EXIT_FAILURE);
+#endif
 				return 0;
 
 			case EIO:
@@ -123,9 +133,24 @@ static int read_frame(void)
 		assert(buf.index < n_buffers);
 
 		process_image(buffers[buf.index].start, buf.bytesused);
+		//fprintf(stderr, "process buf [%d] %p %d\n", buf.index, buffers[buf.index].start, buf.bytesused);
 
+#ifdef USE_FENCE
+		/* Release signaled fence */
+		for (i = 0; i < n_buffers; ++i)
+			if (buf.index == buffers[i].index)
+				break;
+		close(buffers[i].fence_fd);
+
+		/* Request new fence */
+		buf.flags = V4L2_BUF_FLAG_OUT_FENCE;
+#endif
 		if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
 			errno_exit("VIDIOC_QBUF");
+
+#ifdef USE_FENCE
+		buffers[i].fence_fd = buf.fence_fd;
+#endif
 		break;
 
 	case IO_METHOD_USERPTR:
@@ -161,32 +186,93 @@ static int read_frame(void)
 		if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
 			errno_exit("VIDIOC_QBUF");
 		break;
+
+	case IO_METHOD_DMABUF:
+		CLEAR(buf);
+
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_DMABUF;
+
+		if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf)) {
+			switch (errno) {
+			case EAGAIN:
+				return 0;
+
+			case EIO:
+				/* Could ignore EIO, see spec. */
+
+				/* fall through */
+
+			default:
+				errno_exit("VIDIOC_DQBUF");
+			}
+		}
+
+		process_image((void *)buf.m.userptr, buf.bytesused);
+
+		if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
+			errno_exit("VIDIOC_QBUF");
+		break;
 	}
 
 	return 1;
 }
 
+static int wait_select_fence(void)
+{
+	struct timeval tv;
+	int i, max_fd = -1;
+	fd_set fds;
+
+	FD_ZERO(&fds);
+
+	/* Timeout. */
+	tv.tv_sec = 2;
+	tv.tv_usec = 0;
+
+	for (i = 0; i < n_buffers; ++i) {
+		FD_SET(buffers[i].fence_fd, &fds);
+		if (buffers[i].fence_fd >= max_fd)
+			max_fd = buffers[i].fence_fd;
+	}
+	return select(max_fd + 1, &fds, NULL, NULL, &tv);
+}
+
+static int wait_poll_fence(void)
+{
+	struct pollfd fds[n_buffers];
+	int i;
+
+	for (i = 0; i < n_buffers; ++i) {
+	        fds[i].fd = buffers[i].fence_fd;
+	        fds[i].events = POLLIN | POLLERR;
+	}
+        return poll(fds, n_buffers, 2000);
+}
+
+static int wait_poll(void)
+{
+	struct pollfd fds[1];
+
+        fds[0].fd = fd;
+        fds[0].events = POLLIN | POLLERR;
+        return poll(fds, 1, 2000);
+}
+
 static void mainloop(void)
 {
 	unsigned int count;
+	int r;
 
 	count = frame_count;
 
 	while (count-- > 0) {
 		for (;;) {
-			fd_set fds;
-			struct timeval tv;
-			int r;
-
-			FD_ZERO(&fds);
-			FD_SET(fd, &fds);
-
-			/* Timeout. */
-			tv.tv_sec = 2;
-			tv.tv_usec = 0;
-
-			r = select(fd + 1, &fds, NULL, NULL, &tv);
-
+#ifdef USE_FENCE
+			r = wait_poll_fence();
+#else
+			r = wait_poll();
+#endif
 			if (-1 == r) {
 				if (EINTR == errno)
 					continue;
@@ -194,7 +280,7 @@ static void mainloop(void)
 			}
 
 			if (0 == r) {
-				fprintf(stderr, "select timeout\n");
+				fprintf(stderr, "timeout\n");
 				exit(EXIT_FAILURE);
 			}
 
@@ -215,6 +301,7 @@ static void stop_capturing(void)
 		break;
 
 	case IO_METHOD_MMAP:
+	case IO_METHOD_DMABUF:
 	case IO_METHOD_USERPTR:
 		type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		if (-1 == xioctl(fd, VIDIOC_STREAMOFF, &type))
@@ -238,12 +325,22 @@ static void start_capturing(void)
 			struct v4l2_buffer buf;
 
 			CLEAR(buf);
+#ifdef USE_FENCE
+			buf.flags = V4L2_BUF_FLAG_OUT_FENCE;
+#endif
 			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 			buf.memory = V4L2_MEMORY_MMAP;
 			buf.index = i;
 
 			if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
 				errno_exit("VIDIOC_QBUF");
+
+#ifdef USE_FENCE
+			buffers[i].fence_fd = buf.fence_fd;
+			buffers[i].index = buf.index;
+			fprintf(stderr, "queued buffer %d, got fence=%d\n",
+				buf.index, buf.fence_fd);
+#endif
 		}
 		type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		if (-1 == xioctl(fd, VIDIOC_STREAMON, &type))
@@ -268,6 +365,24 @@ static void start_capturing(void)
 		if (-1 == xioctl(fd, VIDIOC_STREAMON, &type))
 			errno_exit("VIDIOC_STREAMON");
 		break;
+
+	case IO_METHOD_DMABUF:
+		for (i = 0; i < n_buffers; ++i) {
+			struct v4l2_buffer buf;
+
+			CLEAR(buf);
+			buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			buf.memory = V4L2_MEMORY_DMABUF;
+			buf.index = i;
+
+			if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
+				errno_exit("VIDIOC_QBUF");
+		}
+		type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		if (-1 == xioctl(fd, VIDIOC_STREAMON, &type))
+			errno_exit("VIDIOC_STREAMON");
+		break;
+
 	}
 }
 
@@ -289,6 +404,8 @@ static void uninit_device(void)
 	case IO_METHOD_USERPTR:
 		for (i = 0; i < n_buffers; ++i)
 			free(buffers[i].start);
+		break;
+	default:
 		break;
 	}
 
@@ -444,6 +561,7 @@ static void init_device(void)
 
 	case IO_METHOD_MMAP:
 	case IO_METHOD_USERPTR:
+	case IO_METHOD_DMABUF:
 		if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
 			fprintf(stderr, "%s does not support streaming i/o\n",
 					dev_name);
@@ -517,6 +635,10 @@ static void init_device(void)
 
 	case IO_METHOD_USERPTR:
 		init_userp(fmt.fmt.pix.sizeimage);
+		break;
+
+	case IO_METHOD_DMABUF:
+		//init_dmabuf();
 		break;
 	}
 }
@@ -622,6 +744,10 @@ int main(int argc, char **argv)
 
 		case 'u':
 			io = IO_METHOD_USERPTR;
+			break;
+
+		case 'a':
+			io = IO_METHOD_DMABUF;
 			break;
 
 		case 'o':
